@@ -82,6 +82,77 @@ def enrich_page(page, info):
         if footer and (re.search(r'©|copyright|all rights reserved', text, re.I) or
                        re.fullmatch(r'(?:slide\s*)?\d+(?:\s*(?:of|/)\s*\d+)?', text, re.I)):
             block.update(classification='footer', suggested_action='keep')
+    associate_math(info['blocks'])
+
+
+def associate_math(blocks):
+    """Associate notation-only fragments with original strong seeds, never prose.
+
+    No transitive propagation: proximity alone must not consume an entire slide.
+    """
+    seeds = [b for b in blocks if b.get('classification') == 'math_formula']
+    for block in blocks:
+        if block.get('suggested_action') == 'keep' or not block.get('horizontal', True):
+            continue
+        # Extraction can concatenate a styled variable with a roman function
+        # (𝑋Var). Preserve that lexical boundary before NFKC turns it into XVar.
+        separated = ''.join(' '+c+' ' if 0x1D400 <= ord(c) <= 0x1D7FF else c for c in block['text'])
+        text = unicodedata.normalize('NFKC', separated).strip()
+        words = re.findall(r'[A-Za-z]+', text)
+        if not text or len(text) > 120 or any(len(w) > 1 and w.lower() not in
+                {'var', 'cov', 'exp', 'log', 'sin', 'cos', 'tan', 'lim', 'max', 'min', 'dx', 'dy'} for w in words):
+            continue
+        if re.search(r'[^\sA-Za-z0-9α-ωΑ-Ω=+*/^().,{}\[\]<>|_−–∫∑√≤≥≠±∞∂-]', text):
+            continue
+        a = fitz.Rect(block['bbox'])
+        size = max((s.get('size', 12) for s in block['spans']), default=12)
+        related = []
+        for seed in seeds:
+            b = fitz.Rect(seed['bbox'])
+            dx = max(a.x0-b.x1, b.x0-a.x1, 0)
+            dy = max(a.y0-b.y1, b.y0-a.y1, 0)
+            if (dy == 0 and dx <= size*.8) or (dx == 0 and dy <= size*.35):
+                related.append(seed['id'])
+        if related:
+            block.update(classification='math_fragment', suggested_action='keep',
+                         math_confidence=.7, math_context_refs=related)
+
+
+def layout_recommendations(page, block, box, size):
+    """Unapplied geometry proposals; apply's collision checks remain authoritative."""
+    result = []
+    others = [b for b in page['blocks'] if b['id'] != block['id']]
+    obstacles = [b['bbox'] for b in others] + page['images']
+    def clear(candidate, excluded=()):
+        r = fitz.Rect(candidate)
+        return (not r.is_empty and fitz.Rect(page['rect']).contains(r) and
+                not any(r.intersects(fitz.Rect(b['bbox'])) for b in others if b['id'] not in excluded) and
+                not any(r.intersects(fitz.Rect(im)) for im in page['images']))
+    # Bounded right expansion preserves the existing left alignment.
+    wider = list(box)
+    wider[2] = min(page['rect'][2]-2, box[2]+max(24, size*3))
+    for obstacle in obstacles:
+        if obstacle[1] < wider[3] and obstacle[3] > wider[1] and obstacle[0] >= box[2]:
+            wider[2] = min(wider[2], obstacle[0]-2)
+    if wider[2] > box[2]+2 and clear(wider):
+        result.append({'kind': 'widen_right', 'box': wider})
+    for im in page['images']:
+        if fitz.Rect(box).intersects(fitz.Rect(im)) and box[1] < im[1] < box[3]:
+            # Source erasure is separate and must itself avoid the image.
+            if not any(fitz.Rect(line).intersects(fitz.Rect(im)) for line in block.get('erase_rects', [block['bbox']])):
+                clipped = [box[0], box[1], box[2], im[1]-2]
+                if clipped[3]-clipped[1] >= size*1.5 and clear(clipped):
+                    result.append({'kind': 'clamp_above_image', 'box': clipped})
+    if re.search(r'\b(?:of|the|a|an|in|on|with|for|to|and|or)\s*$', block['text'], re.I):
+        for other in others:
+            b = other['bbox']
+            if (other.get('suggested_action') != 'keep' and other.get('horizontal', True) and
+                    abs(b[0]-box[0]) <= size*.4 and 0 <= b[1]-block['bbox'][3] <= size*.8 and
+                    not re.match(r'\s*(?:[•●▪]|\d+[.)]|[A-Za-z][.)])', other['text'])):
+                combined = list(fitz.Rect(block['bbox']) | fitz.Rect(b))
+                if clear(combined, (other['id'],)):
+                    result.append({'kind': 'merge_continuation', 'refs': [block['id'], other['id']], 'box': combined})
+    return result
 
 
 def typography_warnings(page, records):

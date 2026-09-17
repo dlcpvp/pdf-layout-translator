@@ -12,12 +12,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 
 import pymupdf as fitz
 from PIL import Image, ImageChops, ImageDraw
-from layout_hints import background_hint, enrich_page, font_stats, typography_warnings
+from layout_hints import background_hint, enrich_page, font_stats, typography_warnings, layout_recommendations
 
 VERSION = 1
 
@@ -150,6 +151,8 @@ def fonts(regular=None, bold=None):
                    Path('/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc')]
         regular = next((p for p in choices if p.is_file()), None)
         if regular is None:
+            regular = discover_cjk_font()
+        if regular is None:
             fail('No CJK font detected. Supply --font /path/to/font.ttf or .ttc.')
     if bold:
         bold = Path(bold).expanduser().resolve()
@@ -159,6 +162,32 @@ def fonts(regular=None, bold=None):
         guesses = [regular.with_name('msyhbd.ttc'), regular.with_name('NotoSansCJK-Bold.ttc')]
         bold = next((p for p in guesses if p.is_file()), regular)
     return regular, bold
+
+
+def discover_cjk_font():
+    candidates = []
+    if shutil.which('fc-list'):
+        try:
+            found = subprocess.run(['fc-list', ':lang=zh', '--format=%{file}\n'],
+                                   capture_output=True, text=True, timeout=10, check=True)
+            candidates.extend(Path(p) for p in sorted(set(found.stdout.splitlines())))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    roots = [Path('/usr/share/fonts'), Path('/usr/local/share/fonts'),
+             Path.home()/'.local/share/fonts', Path.home()/'.fonts', Path.home()/'Library/Fonts']
+    for root in roots:
+        if root.is_dir():
+            candidates.extend(sorted(p for p in root.rglob('*') if p.suffix.lower() in {'.ttf', '.otf', '.ttc'}))
+    for path in dict.fromkeys(candidates):
+        if not path.is_file():
+            continue
+        try:
+            font = fitz.Font(fontfile=str(path))
+            if all(font.has_glyph(ord(c)) for c in '中文学习统计，。'):
+                return path.resolve()
+        except Exception:
+            continue
+    return None
 
 
 class SafeHTML(HTMLParser):
@@ -263,6 +292,8 @@ def write_scaffold(job, manifest, overwrite=False):
                 template['keep'].append({'refs': [block['id']],
                                          'reason': 'Suggested ' + block.get('classification', 'keep') + '; review before applying',
                                          'source_text': block['text']})
+                if block.get('math_context_refs'):
+                    template['keep'][-1]['math_context_refs'] = block['math_context_refs']
                 continue
             sizes = Counter()
             for span in block['spans']:
@@ -283,6 +314,9 @@ def write_scaffold(job, manifest, overwrite=False):
                                       'fill': block.get('suggested_fill') or 'auto',
                                       'fill_confidence': block.get('fill_confidence', 0),
                                       'classification': block.get('classification', 'text')})
+            recommendations = layout_recommendations(page, block, box, size)
+            if recommendations:
+                template['edits'][-1]['layout_recommendations'] = recommendations
     write_json(path, template)
     return template
 
@@ -677,6 +711,8 @@ def apply(args):
             if interleaved_path in requested:
                 os.replace(paired, interleaved_path)
     print(json.dumps({'outputs': [str(p) for p in requested], 'qa': str(job/'qa.json'),
+                      'typography_warnings_count': len(typographic),
+                      'typography_warning_pages': sorted({w['page'] for w in typographic}),
                       'automatic_checks': 'pass', 'visual_review': 'pending'}, ensure_ascii=False))
 
 

@@ -9,10 +9,39 @@ import unittest
 from unittest.mock import patch
 
 import pdf_translate as engine
-from layout_hints import background_hint, math_hint, typography_warnings
+from layout_hints import background_hint, math_hint, typography_warnings, associate_math, layout_recommendations
 
 
 class PipelineTests(unittest.TestCase):
+    def test_context_math_keeps_notation_but_not_prose(self):
+        def block(id, text, box):
+            return {'id': id, 'text': text, 'bbox': box, 'spans': [{'size': 20}]}
+        seed = block('seed', '√', [20, 40, 35, 65])
+        seed.update(classification='math_formula', suggested_action='keep')
+        fragment = block('fragment', 'Var 𝑋Var(𝑌)', [36, 40, 95, 65])
+        prose = block('prose', 'and the variance', [20, 66, 95, 90])
+        remote = block('remote', 'dy', [300, 40, 330, 65])
+        associate_math([seed, fragment, prose, remote])
+        self.assertEqual(fragment['math_context_refs'], ['seed'])
+        self.assertNotIn('suggested_action', prose)
+        self.assertNotIn('suggested_action', remote)
+
+    def test_geometry_proposals_respect_obstacles_and_source_lines(self):
+        block = {'id': 'a', 'text': 'Properties of', 'bbox': [20, 20, 150, 100],
+                 'erase_rects': [[20, 20, 150, 50], [20, 65, 70, 100]]}
+        page = {'rect': [0, 0, 400, 400], 'blocks': [block], 'images': [[90, 90, 200, 180]]}
+        hints = layout_recommendations(page, block, block['bbox'], 20)
+        self.assertEqual(hints, [{'kind': 'clamp_above_image', 'box': [20, 20, 150, 88]}])
+        block['erase_rects'][-1][2] = 110
+        self.assertEqual(layout_recommendations(page, block, block['bbox'], 20), [])
+        page['images'] = []
+        block['bbox'] = [20, 20, 150, 50]
+        page['blocks'].append({'id': 'b', 'text': 'distributions', 'bbox': [20, 55, 160, 80]})
+        hints = layout_recommendations(page, block, block['bbox'], 20)
+        self.assertIn('merge_continuation', [h['kind'] for h in hints])
+        page['blocks'].append({'id': 'c', 'text': 'obstacle', 'bbox': [100, 51, 130, 54]})
+        self.assertNotIn('merge_continuation', [h['kind'] for h in layout_recommendations(page, block, block['bbox'], 20)])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='pdf-skill-test-')
         self.root = Path(self.temp.name)

@@ -81,3 +81,11 @@
 新增的 `typography_warnings` 为非阻断提醒，包括 `orphan_character_detected`（多行文本末行只有 1–2 个汉字）、`line_start_punctuation` 和 `line_end_opening_punctuation`。有意的短行可以保留；不能因为 warning 擅自改写意思。`optimization` 含采用的子集化方法、保存体积及残留大字体警告，fonttools 回退只有逐页视觉一致且体积变小时才采用。
 
 只译部分页时，未选页的所有文字显式列入 keep，并在理由里注明用户选择的页范围；输出仍保持全部原页位置。这不是删除未选页的命令。
+
+## 模板建议与批量编辑
+
+`layout_recommendations` 仅为未应用的建议：`widen_right` 提供有限向右扩框，`clamp_above_image` 在原文行本身不碰图片时提供上沿收剪，`merge_continuation` 提供疑似续句的 refs 和 union box。应用建议前检查实际背景与页面布局，合并后移除原有两项，重新执行 apply 的完整检查。多个建议不能直接同时叠加；收剪后能否容纳译文仍由排版引擎验证。
+
+`math_fragment` 表示邻近强公式块的纯数学片段，`math_context_refs` 记录关联依据；它是待复核 keep，不是公式识别保证。
+
+长文档建议用 `json.load` / `json.dump(..., ensure_ascii=False, indent=2)` 读取模板、按稳定 refs 映射填入译文并应用明确规则，保留可重现脚本。不要重新构造源哈希或无依据清除 review_required；填写完成并逐项复核后才解除复核标记。
