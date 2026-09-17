@@ -1,0 +1,4 @@
+interface:
+  display_name: "PDF 保版式翻译"
+  short_description: "翻译学校课件并保留公式图片，生成目标语言版及逐页交替对照 PDF"
+  default_prompt: "使用 $pdf-layout-translator 将这份课件翻译为简体中文，保留整体版式和公式图片，并生成原文一页、中文一页的交替对照版。"
