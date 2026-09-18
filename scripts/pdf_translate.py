@@ -1,5 +1,6 @@
 """Layout-preserving PDF translation mechanics. Translation is supplied by the agent."""
 import argparse
+import copy
 from collections import Counter
 from contextlib import contextmanager
 import hashlib
@@ -15,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 import pymupdf as fitz
 from PIL import Image, ImageChops, ImageDraw
@@ -117,11 +119,16 @@ def layout(doc, hints=False):
     return pages
 
 
-def render(doc, destination, scale=1.5):
+def render(doc, destination, scale=1.5, page_numbers=None):
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
+    # A changed-pages preview may have fewer sheets than the previous run.
+    for old in destination.glob('contact-*.png'):
+        old.unlink()
     thumbs = []
     for pn, page in enumerate(doc, 1):
+        if page_numbers is not None and pn not in page_numbers:
+            continue
         pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
         im = Image.frombytes('RGB', (pix.width, pix.height), pix.samples)
         im.save(destination / f'page-{pn:03d}.png')
@@ -272,6 +279,32 @@ def prepare(args):
                       'warnings': {p['page']: p['warnings'] for p in pages if p['warnings']}}, ensure_ascii=False))
 
 
+def fill_plan(args):
+    """Inject a compact refs-to-HTML map without asking the agent to copy geometry."""
+    job = args.job.resolve()
+    plan = read_json(job/'plan.template.json')
+    translations = read_json(args.translations)
+    expected = {e['refs'][0] for e in plan['edits'] if len(e['refs']) == 1}
+    if len(expected) != len(plan['edits']):
+        fail('fill requires one unique block ref per template edit; edit merged plans directly.')
+    if not isinstance(translations, dict) or set(translations) != expected:
+        fail('Translation keys must exactly match template edit refs (no missing or extra entries).')
+    for edit in plan['edits']:
+        value = translations[edit['refs'][0]]
+        if not isinstance(value, str):
+            fail('Each translation must be an HTML string.')
+        SafeHTML(value)
+        edit['html'] = value
+    plan['review_required'] = not args.reviewed
+    destination = job/'plan.json'
+    if destination.exists() and not args.overwrite:
+        existing = read_json(destination)
+        if existing.get('edits') or existing.get('keep'):
+            fail('plan.json already contains decisions; use --overwrite only to replace them intentionally.')
+    write_json(destination, plan)
+    print(json.dumps({'plan': str(destination), 'edits': len(plan['edits']), 'review_required': plan['review_required']}))
+
+
 def color(value):
     if not isinstance(value, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}', value):
         fail('Colors must be #RRGGBB strings.')
@@ -336,7 +369,7 @@ def scaffold(args):
                       'suggested_keeps': len(template['keep']), 'review_required': True}))
 
 
-def build_plan(doc, plan, regular, bold):
+def build_plan(doc, plan, regular, bold, adaptive=False):
     if plan.get('review_required'):
         fail('Scaffold review_required is true. Review all suggestions and translations before applying.')
     pages = layout(doc)
@@ -429,44 +462,69 @@ def build_plan(doc, plan, regular, bold):
     omitted = set(all_spans) - set(taken)
     if omitted:
         fail(f'{len(omitted)} text spans have no edit/keep decision; first: {", ".join(sorted(omitted)[:12])}')
+    groups = {p['page']: [r for r in records if r['page'] == p['page']] for p in pages}
     image_cache = {}
-    for i, rec in enumerate(records):
-        pn = rec['page']
-        zones = rec['erase'] + [rec['box']]
-        for sid, span in all_spans.items():
-            if sid.startswith(f'p{pn:03d}.') and sid not in rec['atoms']:
-                if any(overlap(z, span['bbox']) for z in zones):
-                    fail(f'Edit {i} overlaps another text span {sid}; merge refs or tighten box.')
-        for info in doc[pn-1].get_image_info(xrefs=True):
-            image_box = info['bbox']
-            for z in zones:
-                if not overlap(z, image_box):
-                    continue
-                # Some slide images include white padding under a text metric box.
-                # Permit only padding matching the fill; verify every image again after rendering.
-                xref = info.get('xref', 0)
-                transform = info['transform']
-                if not xref or abs(transform[1]) > .01 or abs(transform[2]) > .01 or transform[0] <= 0 or transform[3] <= 0:
-                    fail(f'Edit {i} overlaps an inline/rotated image; inspect separately.')
-                if xref not in image_cache:
-                    asset = doc.extract_image(xref)
-                    image_cache[xref] = Image.open(BytesIO(asset['image'])).convert('RGB')
-                raster = image_cache[xref]
-                crop = fitz.Rect(z) & fitz.Rect(image_box)
-                bounds = fitz.Rect(image_box)
-                coords = ((crop.x0-bounds.x0)*raster.width/bounds.width,
-                          (crop.y0-bounds.y0)*raster.height/bounds.height,
-                          (crop.x1-bounds.x0)*raster.width/bounds.width,
-                          (crop.y1-bounds.y0)*raster.height/bounds.height)
-                region = raster.crop((math.floor(coords[0]), math.floor(coords[1]), math.ceil(coords[2]), math.ceil(coords[3])))
-                bg = Image.new('RGB', region.size, tuple(round(c*255) for c in color(rec['fill'])))
-                extrema = ImageChops.difference(region, bg).getextrema()
-                if any(high > 2 for low, high in extrema):
-                    fail(f'Edit {i} covers visible image pixels; tighten its box or keep this region.')
-        for other in records[i+1:]:
-            if pn == other['page'] and overlap(rec['box'], other['box']):
-                fail(f'Overlapping output boxes on page {pn}.')
+    for page in pages:
+        spans = {s['id']: s for b in page['blocks'] for s in b['spans'] if s['text'].strip()}
+        if adaptive:
+            for rec in groups[page['page']]:
+                clamp_image_box(rec, page)
+        for rec in groups[page['page']]:
+            validate_record(doc, rec, groups[page['page']], spans, image_cache)
     return records, pages
+
+
+def validate_record(doc, rec, group, all_spans, image_cache):
+    pn = rec['page']
+    zones = rec['erase'] + [rec['box']]
+    for sid, span in all_spans.items():
+        if sid not in rec['atoms']:
+            if any(overlap(z, span['bbox']) for z in zones):
+                fail(f'Edit {rec["refs"]} overlaps another text span {sid}; merge refs or tighten box.')
+    for info in doc[pn-1].get_image_info(xrefs=True):
+        image_box = info['bbox']
+        for z in zones:
+            if not overlap(z, image_box):
+                continue
+            # Some slide images include white padding under a text metric box.
+            # Permit only padding matching the fill; verify every image again after rendering.
+            xref = info.get('xref', 0)
+            transform = info['transform']
+            if not xref or abs(transform[1]) > .01 or abs(transform[2]) > .01 or transform[0] <= 0 or transform[3] <= 0:
+                fail(f'Edit {rec["refs"]} overlaps an inline/rotated image; inspect separately.')
+            if xref not in image_cache:
+                asset = doc.extract_image(xref)
+                image_cache[xref] = Image.open(BytesIO(asset['image'])).convert('RGB')
+            raster = image_cache[xref]
+            crop = fitz.Rect(z) & fitz.Rect(image_box)
+            bounds = fitz.Rect(image_box)
+            coords = ((crop.x0-bounds.x0)*raster.width/bounds.width,
+                      (crop.y0-bounds.y0)*raster.height/bounds.height,
+                      (crop.x1-bounds.x0)*raster.width/bounds.width,
+                      (crop.y1-bounds.y0)*raster.height/bounds.height)
+            region = raster.crop((math.floor(coords[0]), math.floor(coords[1]), math.ceil(coords[2]), math.ceil(coords[3])))
+            bg = Image.new('RGB', region.size, tuple(round(c*255) for c in color(rec['fill'])))
+            extrema = ImageChops.difference(region, bg).getextrema()
+            if any(high > 2 for low, high in extrema):
+                fail(f'Edit {rec["refs"]} covers visible image pixels; tighten its box or keep this region.')
+    for other in group:
+        if other is not rec and overlap(rec['box'], other['box']):
+            fail(f'Overlapping output boxes on page {pn}.')
+
+
+def clamp_image_box(rec, page):
+    original_box = list(rec['box'])
+    box = list(original_box)
+    for image in page['images']:
+        if overlap(box, image) and box[1] < image[1] < box[3]:
+            if not any(overlap(line, image) for line in rec['erase']):
+                bottom = image[1]-2
+                if bottom-box[1] >= rec['font_size']*1.5:
+                    box[3] = bottom
+    if box != original_box:
+        rec['requested_box'] = original_box
+        rec['box'] = box
+        rec['layout_adjustment'] = 'clamp_above_image'
 
 
 def image_for(page, scale=1.5):
@@ -621,8 +679,143 @@ def ensure_outputs(paths, protected, overwrite):
             fail(f'Output exists: {path}. Use --overwrite only for intended replacement.')
 
 
+def expanded_boxes(rec, page, group):
+    """Bounded alternatives in free space; never merge semantic regions."""
+    box = rec['box']
+    size = rec['font_size']
+    obstacles = [s['bbox'] for b in page['blocks'] for s in b['spans']
+                 if s['id'] not in rec['atoms'] and s['text'].strip()]
+    obstacles += page['images'] + [r['box'] for r in group if r is not rec]
+    left, right = max(page['rect'][0]+2, box[0]-3*size), min(page['rect'][2]-2, box[2]+3*size)
+    for o in obstacles:
+        if o[1] < box[3] and o[3] > box[1]:
+            if o[0] >= box[2]:
+                right = min(right, o[0]-2)
+            if o[2] <= box[0]:
+                left = max(left, o[2]+2)
+    horizontal = list(box)
+    if rec['align'] == 'center':
+        delta = max(0, min(box[0]-left, right-box[2]))
+        horizontal[0] -= delta
+        horizontal[2] += delta
+    elif rec['align'] == 'right':
+        horizontal[0] = min(box[0], left)
+    else:
+        horizontal[2] = max(box[2], right)
+    candidates = [horizontal]
+    for base in (box, horizontal):
+        lower = min(page['rect'][3]-2, box[3]+size*2)
+        for o in obstacles:
+            if o[0] < base[2] and o[2] > base[0] and o[1] >= box[3]:
+                lower = min(lower, o[1]-2)
+        candidates.append([base[0], base[1], base[2], max(box[3], lower)])
+    unique = []
+    for candidate in candidates:
+        if candidate != box and candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def extension_is_blank(source_page, original_box, candidate, fill, erase=()):
+    # Check actual added pixels, including vector rules / colored panels that
+    # do not occur in the text and image obstacle lists.
+    scale = 1.5
+    raster = image_for(source_page, scale)
+    bounds = (math.floor(candidate[0]*scale), math.floor(candidate[1]*scale),
+              math.ceil(candidate[2]*scale), math.ceil(candidate[3]*scale))
+    region = raster.crop(bounds)
+    bg = Image.new('RGB', region.size, tuple(round(c*255) for c in color(fill)))
+    diff = ImageChops.difference(region, bg)
+    for masked in [original_box, *erase]:
+        ImageDraw.Draw(diff).rectangle((math.floor(masked[0]*scale)-bounds[0],
+                                       math.floor(masked[1]*scale)-bounds[1],
+                                       math.ceil(masked[2]*scale)-bounds[0],
+                                       math.ceil(masked[3]*scale)-bounds[1]), fill=(0, 0, 0))
+    return all(high <= 3 for low, high in diff.getextrema())
+
+
+def place_record(page, source, rec, page_info, group, css, archive, adaptive):
+    spare, scale = page.insert_htmlbox(rec['box'], rec['html'], css=css, archive=archive, scale_low=rec['min_scale'])
+    if spare < 0 and adaptive:
+        original_box = list(rec['box'])
+        spans = {s['id']: s for b in page_info['blocks'] for s in b['spans'] if s['text'].strip()}
+        for candidate in expanded_boxes(rec, page_info, group):
+            rec['box'] = candidate
+            try:
+                validate_record(source.parent, rec, group, spans, {})
+                safe = extension_is_blank(source, original_box, candidate, rec['fill'], rec['erase'])
+            except ValueError:
+                safe = False
+            if safe:
+                # Pinned insert_htmlbox returns before writing on a failed fit.
+                spare, scale = page.insert_htmlbox(candidate, rec['html'], css=css, archive=archive, scale_low=rec['min_scale'])
+                if spare >= 0:
+                    rec.setdefault('requested_box', original_box)
+                    rec['layout_adjustment'] = 'expand_into_blank_space'
+                    break
+            rec['box'] = original_box
+    if spare < 0:
+        return {'page': rec['page'], 'refs': rec['refs'], 'code': 'text_overflow',
+                'box': rec['box'], 'message': 'Adjust box/font or split the paragraph without omitting content.'}
+    rec['scale'] = scale
+    rec['effective_font_size'] = rec['font_size'] * scale
+    return None
+
+
+def content_key(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def graft_page_content(target, cached, index):
+    """Reuse drawing content while retaining the source page tree and links."""
+    target_xref = target[index].xref
+    target.insert_pdf(cached, from_page=index, to_page=index, links=False, annots=False)
+    copied_xref = target[-1].xref
+    for key in ('Contents', 'Resources'):
+        target.xref_set_key(target_xref, key, target.xref_get_key(copied_xref, key)[1])
+    target.delete_page(len(target)-1)
+
+
+def load_layout_cache(job, source_key, page_count):
+    path = job/'layout-cache.pdf'
+    try:
+        info = read_json(job/'layout-cache.json')
+        if info['source_key'] != source_key or info['pdf_sha256'] != sha(path):
+            return None, {}
+        entries = info['pages']
+        if not isinstance(entries, dict) or any(
+                not isinstance(key, str) or not key.isdigit() or not 1 <= int(key) <= page_count or
+                not isinstance(entry, dict) or not isinstance(entry.get('key'), str) or
+                not isinstance(entry.get('records'), list) or
+                any(not isinstance(rec, dict) for rec in entry['records'])
+                for key, entry in entries.items()):
+            return None, {}
+        doc = open_pdf(path)
+        if len(doc) != page_count:
+            doc.close()
+            return None, {}
+        return doc, info['pages']
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        return None, {}
+
+
+def store_layout_cache(job, pdf, source_key, pages):
+    # PDF first, metadata last. An interrupted pair fails the digest check.
+    staging = job/'layout-cache.pending.pdf'
+    shutil.copyfile(pdf, staging)
+    os.replace(staging, job/'layout-cache.pdf')
+    write_json(job/'layout-cache.json', {'source_key': source_key, 'pdf_sha256': sha(job/'layout-cache.pdf'), 'pages': pages})
+
+
 def apply(args):
+    started = time.perf_counter()
+    timings = {}
     job = args.job.resolve()
+    draft = getattr(args, 'draft', False)
+    adaptive = getattr(args, 'layout', 'auto') == 'auto'
+    use_cache = not getattr(args, 'no_cache', False)
+    preview = getattr(args, 'preview', None) or ('changed' if draft else 'all')
+    mode = 'translated' if draft else args.mode
     manifest = read_json(job/'manifest.json')
     plan = read_json(job/'plan.json')
     if manifest.get('schema_version') != VERSION or plan.get('schema_version') != VERSION:
@@ -638,20 +831,24 @@ def apply(args):
     font, bold = fonts(args.font, args.bold_font)
     out_dir = args.out_dir.resolve()
     stem = Path(manifest['source_name']).stem
-    translated_path = out_dir/f'{stem}_{target}.pdf'
+    translated_path = out_dir/(f'{stem}_{target}_draft.pdf' if draft else f'{stem}_{target}.pdf')
     interleaved_path = out_dir/f'{stem}_original-{target}.pdf'
-    requested = ([translated_path] if args.mode == 'translated' else
-                 [interleaved_path] if args.mode == 'interleaved' else [translated_path, interleaved_path])
+    requested = ([translated_path] if mode == 'translated' else
+                 [interleaved_path] if mode == 'interleaved' else [translated_path, interleaved_path])
     ensure_outputs(requested, [job/'source.pdf', job/'plan.json', job/'manifest.json'], args.overwrite)
+    qa_path = job/('qa-draft.json' if draft else 'qa.json')
+    source_key = content_key([fingerprint, sha(font), sha(bold), fitz.VersionBind,
+                              sha(Path(__file__)), sha(Path(__file__).with_name('layout_hints.py')), adaptive])
     with open_pdf(job/'source.pdf') as original:
-        records, pages = build_plan(original, plan, font, bold)
+        records, pages = build_plan(original, plan, font, bold, adaptive=adaptive)
         if not records:
             fail('No translation edits. Use interleave for existing PDFs.')
         for rec in records:
-            # White is only a default; show potentially nonwhite backgrounds for review.
             rec['background_review'] = rec['fill'] != '#ffffff'
+        groups = {p['page']: [r for r in records if r['page'] == p['page']] for p in pages}
+        page_keys = {str(pn): content_key(group) for pn, group in groups.items()}
+        timings['planning'] = round(time.perf_counter()-started, 3)
         out_dir.mkdir(parents=True, exist_ok=True)
-        # All artifacts are validated in staging before delivery paths are replaced.
         with tempfile.TemporaryDirectory(prefix='.pdf-translate-', dir=out_dir) as temp_name:
             temp = Path(temp_name)
             font_dir = temp/'fonts'
@@ -661,58 +858,116 @@ def apply(args):
             shutil.copyfile(font, font_dir/regular_name)
             shutil.copyfile(bold, font_dir/bold_name)
             archive = fitz.Archive(str(font_dir))
+            cached, cache_pages = load_layout_cache(job, source_key, len(original)) if use_cache else (None, {})
+            changed, reused, failures, next_cache = [], [], [], {}
             translated = open_pdf(job/'source.pdf')
+            layout_started = time.perf_counter()
             try:
-                for pn in range(1, len(translated)+1):
-                    group = [r for r in records if r['page'] == pn]
+                for pn, group in groups.items():
+                    key = str(pn)
+                    entry = cache_pages.get(key, {})
+                    if (cached is not None and entry.get('key') == page_keys[key] and
+                            len(entry['records']) == len(group) and
+                            all(stored.get('refs') == rec['refs'] and stored.get('page') == pn
+                                for rec, stored in zip(group, entry['records']))):
+                        graft_page_content(translated, cached, pn-1)
+                        for rec, stored in zip(group, entry['records']):
+                            rec.clear()
+                            rec.update(stored)
+                        reused.append(pn)
+                        next_cache[key] = entry
+                        continue
                     if not group:
                         continue
+                    changed.append(pn)
                     page = translated[pn-1]
                     for rec in group:
                         for box in rec['erase']:
                             page.add_redact_annot(box, fill=color(rec['fill']), cross_out=False)
                     page.apply_redactions(images=0, graphics=0)
+                    page_failures = []
                     for rec in group:
                         css = f'''@font-face{{font-family:localfont;src:url({regular_name})}}
                         @font-face{{font-family:localfont;src:url({bold_name});font-weight:bold}}
                         body{{margin:0;padding:0;font-family:localfont;font-size:{rec['font_size']}pt;
                         line-height:1.28;color:{rec['color']};text-align:{rec['align']}}}
-                        b,strong{{font-weight:bold;color:#17304d}} .math{{font-family:serif;color:#632523}} sub,sup{{font-size:70%}}'''
-                        spare, scale = page.insert_htmlbox(rec['box'], rec['html'], css=css, archive=archive, scale_low=rec['min_scale'])
-                        if spare < 0:
-                            fail(f'Text overflow on page {pn}, refs {rec["refs"]}. Adjust wording/box/font without omitting content.')
-                        rec['scale'] = scale
-                        rec['effective_font_size'] = rec['font_size'] * scale
+                        b,strong{{font-weight:bold}} .math{{font-family:serif}} sub,sup{{font-size:70%}}'''
+                        problem = place_record(page, original[pn-1], rec, pages[pn-1], group, css, archive, adaptive)
+                        if problem:
+                            page_failures.append(problem)
+                    failures.extend(page_failures)
+                    if not page_failures:
+                        next_cache[key] = {'key': page_keys[key], 'records': copy.deepcopy(group)}
+                timings['layout'] = round(time.perf_counter()-layout_started, 3)
                 translated.set_metadata({**translated.metadata, 'title': stem + ' - ' + target})
                 candidate = temp/'translated.pdf'
-                optimization = {'translated': save_compact(translated, candidate)}
+                save_started = time.perf_counter()
+                if draft or failures:
+                    # Deduplicate identical font streams before compression.
+                    # Skipping this makes trial files grow by a full CJK font
+                    # per HTML block and is much slower than garbage level 4.
+                    translated.save(candidate, garbage=4, deflate=True)
+                    optimization = {'translated': {'method': 'deferred', 'final_bytes': candidate.stat().st_size}}
+                else:
+                    optimization = {'translated': save_compact(translated, candidate)}
+                timings['save_and_optimize'] = round(time.perf_counter()-save_started, 3)
             finally:
                 translated.close()
+                if cached is not None:
+                    cached.close()
+            if failures:
+                # Incomplete PDFs remain private checkpoints, never deliverables.
+                if use_cache:
+                    store_layout_cache(job, candidate, source_key, next_cache)
+                timings['total'] = round(time.perf_counter()-started, 3)
+                write_json(job/'apply-errors.json', {'source_sha256': fingerprint, 'plan_sha256': sha(job/'plan.json'),
+                           'failures': failures, 'failed_pages': sorted({f['page'] for f in failures}),
+                           'reused_pages': reused, 'timings_seconds': timings})
+                fail(f'Text overflow in {len(failures)} edits on pages {sorted({f["page"] for f in failures})}; '
+                     f'see {job/"apply-errors.json"}. Successful pages are cached when caching is enabled.')
             with open_pdf(candidate) as checked:
+                check_started = time.perf_counter()
                 checks = verify_translation(original, checked, records)
-                render(checked, job/'preview-translated')
                 typographic = []
                 for pn, page in enumerate(checked, 1):
-                    typographic.extend(typography_warnings(page, [r for r in records if r['page'] == pn]))
+                    typographic.extend(typography_warnings(page, groups[pn]))
+                timings['verification'] = round(time.perf_counter()-check_started, 3)
+                preview_started = time.perf_counter()
+                preview_pages = list(range(1, len(checked)+1)) if preview == 'all' else changed if preview == 'changed' else []
+                preview_dir = job/('preview-draft' if draft else 'preview-translated')
+                if preview_pages:
+                    render(checked, preview_dir, page_numbers=preview_pages)
+                timings['preview'] = round(time.perf_counter()-preview_started, 3)
+                pair_started = time.perf_counter()
                 paired = temp/'interleaved.pdf'
-                if args.mode != 'translated':
+                if mode != 'translated':
                     optimization['interleaved'] = make_interleaved(original, checked, paired)
+                timings['interleave'] = round(time.perf_counter()-pair_started, 3)
+            cache_started = time.perf_counter()
+            if use_cache and (changed or not cache_pages or not draft):
+                store_layout_cache(job, candidate, source_key, next_cache)
+            timings['cache_write'] = round(time.perf_counter()-cache_started, 3)
+            timings['total'] = round(time.perf_counter()-started, 3)
             qa = {'schema_version': VERSION, 'source_sha256': fingerprint, 'plan_sha256': sha(job/'plan.json'),
-                  'engine': fitz.VersionBind, 'automatic_checks': 'pass',
+                  'engine': fitz.VersionBind, 'automatic_checks': 'pass', 'draft': draft,
                   'visual_review': 'pending_agent_review', 'translation_semantics': 'not_checked_by_script',
                   'typography_warnings': typographic, 'optimization': optimization,
+                  'timings_seconds': timings, 'reused_pages': reused, 'typeset_pages': changed,
+                  'preview_pages': preview_pages, 'preview_directory': str(preview_dir),
                   'pages': checks, 'edits': records, 'keep': plan['keep'],
                   'source_warnings': {p['page']: p['warnings'] for p in pages if p['warnings']},
                   'image_text': 'Images preserved; OCR and image text translation not performed',
                   'outputs': {str(p): sha(candidate if p == translated_path else paired) for p in requested}}
-            write_json(job/'qa.json', qa)
+            write_json(qa_path, qa)
+            (job/'apply-errors.json').unlink(missing_ok=True)
             if translated_path in requested:
                 os.replace(candidate, translated_path)
             if interleaved_path in requested:
                 os.replace(paired, interleaved_path)
-    print(json.dumps({'outputs': [str(p) for p in requested], 'qa': str(job/'qa.json'),
+    print(json.dumps({'outputs': [str(p) for p in requested], 'qa': str(qa_path), 'draft': draft,
                       'typography_warnings_count': len(typographic),
                       'typography_warning_pages': sorted({w['page'] for w in typographic}),
+                      'reused_pages': reused, 'typeset_pages': changed, 'timings_seconds': timings,
                       'automatic_checks': 'pass', 'visual_review': 'pending'}, ensure_ascii=False))
 
 
@@ -751,6 +1006,12 @@ def parser():
     prep.add_argument('--target', default='zh-CN')
     prep.add_argument('--no-preview', action='store_true')
     prep.set_defaults(func=prepare)
+    fill = commands.add_parser('fill', help='Fill template geometry from a compact block-ref to HTML JSON map')
+    fill.add_argument('--job', type=Path, required=True)
+    fill.add_argument('--translations', type=Path, required=True)
+    fill.add_argument('--reviewed', action='store_true', help='Confirm translation and template keep decisions have been reviewed')
+    fill.add_argument('--overwrite', action='store_true')
+    fill.set_defaults(func=fill_plan)
     sc = commands.add_parser('scaffold', help='Build a reviewable plan template without replacing plan.json')
     sc.add_argument('--job', type=Path, required=True)
     sc.add_argument('--overwrite', action='store_true')
@@ -765,7 +1026,11 @@ def parser():
     ap.add_argument('--out-dir', type=Path, required=True)
     ap.add_argument('--font')
     ap.add_argument('--bold-font')
-    ap.add_argument('--mode', choices=['both', 'translated', 'interleaved'], default='both')
+    ap.add_argument('--mode', choices=['both', 'translated', 'interleaved'], default='translated')
+    ap.add_argument('--draft', action='store_true', help='Translated-only trial; defer font optimization')
+    ap.add_argument('--layout', choices=['auto', 'strict'], default='auto', help='Try bounded safe box adjustments, or preserve exact planned boxes')
+    ap.add_argument('--preview', choices=['all', 'changed', 'none'], help='Default: all for final, changed for draft')
+    ap.add_argument('--no-cache', action='store_true', help='Disable page layout checkpoint reuse')
     ap.add_argument('--overwrite', action='store_true')
     ap.set_defaults(func=apply)
     ip = commands.add_parser('interleave', help='Alternate existing source and translation pages')

@@ -77,10 +77,124 @@ class PipelineTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def apply(self):
+    def apply(self, **options):
         engine.write_json(self.job/'plan.json', self.plan)
+        args = dict(job=self.job, out_dir=self.output, mode='both', font=None, bold_font=None,
+                    overwrite=False, layout='strict')
+        args.update(options)
+        with contextlib.redirect_stdout(StringIO()) as output:
+            engine.apply(argparse.Namespace(**args))
+        return engine.json.loads(output.getvalue())
+
+    def test_draft_cache_reuses_only_unchanged_pages_and_final_checks(self):
+        first = self.apply(draft=True, preview='none')
+        self.assertEqual(first['typeset_pages'], [1, 2])
+        self.assertFalse((self.output/'source_original-zh-CN.pdf').exists())
+        draft_qa = engine.read_json(self.job/'qa-draft.json')
+        self.assertEqual(draft_qa['optimization']['translated']['method'], 'deferred')
+        self.plan['edits'][0]['html'] = '新的学习目标'
+        second = self.apply(draft=True, preview='none', overwrite=True)
+        self.assertEqual(second['reused_pages'], [2])
+        self.assertEqual(second['typeset_pages'], [1])
+        final = self.apply(preview='none')
+        self.assertEqual(final['reused_pages'], [1, 2])
+        self.assertEqual(final['typeset_pages'], [])
+        self.assertFalse(final['draft'])
+        self.assertTrue((self.output/'source_original-zh-CN.pdf').exists())
+        with engine.open_pdf(self.output/'source_zh-CN.pdf') as doc:
+            self.assertIn('新的学习目标', doc[0].get_text())
+            self.assertNotIn('Learning objectives', doc[0].get_text())
+
+    def test_failures_are_aggregated_and_successful_pages_resume(self):
+        good = self.plan['edits'][2]['html']
+        self.plan['edits'][2]['html'] = '长文' * 2000
+        with self.assertRaisesRegex(ValueError, 'overflow'):
+            self.apply(draft=True, preview='none')
+        report = engine.read_json(self.job/'apply-errors.json')
+        self.assertEqual(report['failed_pages'], [2])
+        self.assertEqual(list(self.output.glob('*.pdf')), [])
+        self.plan['edits'][2]['html'] = good
+        result = self.apply(draft=True, preview='none')
+        self.assertEqual(result['reused_pages'], [1])
+        self.assertEqual(result['typeset_pages'], [2])
+        self.assertFalse((self.job/'apply-errors.json').exists())
+
+    def test_corrupted_cache_is_ignored(self):
+        self.apply(draft=True, preview='none')
+        (self.job/'layout-cache.pdf').write_bytes(b'broken cache')
+        result = self.apply(draft=True, preview='none', overwrite=True)
+        self.assertEqual(result['reused_pages'], [])
+
+    def test_auto_expands_short_box_without_changing_plan(self):
+        self.plan['edits'][0].update(html='学习目标', box=[30, 20, 65, 60], min_scale=1)
+        with self.assertRaisesRegex(ValueError, 'overflow'):
+            self.apply(draft=True, preview='none')
+        self.apply(draft=True, preview='none', layout='auto')
+        qa = engine.read_json(self.job/'qa-draft.json')
+        rec = qa['edits'][0]
+        self.assertEqual(rec['layout_adjustment'], 'expand_into_blank_space')
+        self.assertEqual(rec['requested_box'], [30, 20, 65, 60])
+        self.assertGreater(rec['box'][2], 65)
+        self.assertEqual(engine.read_json(self.job/'plan.json')['edits'][0]['box'], [30, 20, 65, 60])
+
+    def test_auto_clamps_image_overlap_but_strict_rejects_it(self):
+        self.plan['edits'][1]['box'] = [250, 90, 450, 340]
+        self.apply(draft=True, preview='none', layout='auto')
+        rec = engine.read_json(self.job/'qa-draft.json')['edits'][1]
+        self.assertEqual(rec['box'][3], 238)
+        self.assertEqual(rec['layout_adjustment'], 'clamp_above_image')
+
+    def test_auto_extension_rejects_visible_vector_pixels(self):
+        doc = engine.fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.draw_rect([90, 20, 120, 60], fill=(1, 0, 0), color=None)
+        self.assertFalse(engine.extension_is_blank(page, [20, 20, 80, 60], [20, 20, 130, 60], '#ffffff'))
+        self.assertTrue(engine.extension_is_blank(page, [20, 80, 80, 120], [20, 80, 130, 120], '#ffffff'))
+        doc.close()
+
+    def test_multiple_page_overflows_reported_together(self):
+        self.plan['edits'][0]['html'] = '文本' * 1200
+        self.plan['edits'][2]['html'] = '文本' * 1200
+        with self.assertRaisesRegex(ValueError, 'overflow'):
+            self.apply(draft=True, preview='none')
+        report = engine.read_json(self.job/'apply-errors.json')
+        self.assertEqual(report['failed_pages'], [1, 2])
+        self.assertEqual(len(report['failures']), 2)
+
+    def test_cache_graft_preserves_page_tree_links_and_appearance(self):
+        with engine.open_pdf(self.source) as original, engine.open_pdf(self.source) as cached:
+            original[0].insert_link({'kind': engine.fitz.LINK_GOTO, 'from': engine.fitz.Rect(30, 30, 90, 50), 'page': 1})
+            original.set_toc([[1, 'Second page', 2]])
+            cached[0].insert_text((30, 220), 'Cached addition', fontsize=12)
+            before = engine.image_for(cached[0]).tobytes()
+            engine.graft_page_content(original, cached, 0)
+            result = self.root/'grafted.pdf'
+            original.save(result)
+        with engine.open_pdf(result) as checked:
+            self.assertEqual(len(checked), 2)
+            self.assertEqual(engine.image_for(checked[0]).tobytes(), before)
+            self.assertEqual(checked[0].get_links()[0]['page'], 1)
+            self.assertEqual(checked.get_toc(), [[1, 'Second page', 2]])
+
+    def test_fill_map_validates_coverage_and_preserves_review_gate(self):
+        template = engine.read_json(self.job/'plan.template.json')
+        mapping = {e['refs'][0]: '译文' for e in template['edits']}
+        path = self.root/'translations.json'
+        engine.write_json(path, mapping)
+        args = argparse.Namespace(job=self.job, translations=path, reviewed=False, overwrite=False)
         with contextlib.redirect_stdout(StringIO()):
-            engine.apply(argparse.Namespace(job=self.job, out_dir=self.output, mode='both', font=None, bold_font=None, overwrite=False))
+            engine.fill_plan(args)
+        filled = engine.read_json(self.job/'plan.json')
+        self.assertTrue(filled['review_required'])
+        self.assertEqual(filled['keep'], template['keep'])
+        self.assertEqual(filled['edits'][0]['box'], template['edits'][0]['box'])
+        with self.assertRaisesRegex(ValueError, 'already contains'):
+            engine.fill_plan(args)
+        mapping['unexpected'] = '多余译文'
+        engine.write_json(path, mapping)
+        args.overwrite = True
+        with self.assertRaisesRegex(ValueError, 'exactly match'):
+            engine.fill_plan(args)
 
     def test_complete_translation_and_alternating_pages(self):
         self.apply()

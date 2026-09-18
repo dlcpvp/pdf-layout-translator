@@ -52,7 +52,7 @@
 | --- | --- |
 | `refs` | 同一页上一个或多个块/span，不能跨页。所引源文字将删除。 |
 | `html` | 译文，使用下述受限 HTML。 |
-| `box` | 所有 refs 的外接矩形。译文排在此框；不会自动扩大。 |
+| `box` | 所有 refs 的外接矩形。译文优先排在此框；auto 模式仅在溢出时尝试有限安全扩框，strict 模式不改框。 |
 | `font_size` | 来源 span 的最大字号。标题/正文有需要时显式调整。 |
 | `min_scale` | 0.82；最小允许缩放，范围 0.5–1。达不到仍放不下就失败。 |
 | `align` | `left`；还支持 `center`、`right`、`justify`。 |
@@ -84,8 +84,18 @@
 
 ## 模板建议与批量编辑
 
-`layout_recommendations` 仅为未应用的建议：`widen_right` 提供有限向右扩框，`clamp_above_image` 在原文行本身不碰图片时提供上沿收剪，`merge_continuation` 提供疑似续句的 refs 和 union box。应用建议前检查实际背景与页面布局，合并后移除原有两项，重新执行 apply 的完整检查。多个建议不能直接同时叠加；收剪后能否容纳译文仍由排版引擎验证。
+`layout_recommendations` 是提示数据，apply 不直接信任其坐标：`widen_right` 提供有限向右扩框，`clamp_above_image` 在原文行本身不碰图片时提供上沿收剪，`merge_continuation` 提供疑似续句的 refs 和 union box。auto 模式会独立检测图片收剪和空白扩框；strict 模式不会自动调整。语义合并始终需要检查实际页面并移除原有两项，重新执行 apply 的完整检查。多个建议不能直接同时叠加；收剪后能否容纳译文仍由排版引擎验证。
 
 `math_fragment` 表示邻近强公式块的纯数学片段，`math_context_refs` 记录关联依据；它是待复核 keep，不是公式识别保证。
 
 长文档建议用 `json.load` / `json.dump(..., ensure_ascii=False, indent=2)` 读取模板、按稳定 refs 映射填入译文并应用明确规则，保留可重现脚本。不要重新构造源哈希或无依据清除 review_required；填写完成并逐项复核后才解除复核标记。
+
+## 快速填写和迭代
+
+`fill --job <DIR> --translations <JSON> [--reviewed]` 接受 `{块ID: HTML译文}`，要求 keys 与模板 edits 一一对应，不包含 keep。它沿用模板几何、哈希及 keep 决策，不自动批准复核；检查完 keep 和译文后才传 `--reviewed`。已有非空 plan 需显式 `--overwrite` 才能替换。合并后的多 refs 计划直接编辑，不经 fill 重建。
+
+apply 默认 `--layout auto --mode translated`。自动收剪只在原文行没有碰图片时尝试；扩框只在溢出后尝试，检查其他原文、译文框、图片及新增区域的实际像素，保持 min_scale 下限。不能修复的几何问题仍阻断执行。不会自动合并正文、遗漏译文或跨页重排。
+
+`--draft` 跳过压缩与对照合成，输出独立 `_draft.pdf` 和 `qa-draft.json`，不覆盖最终交付；正常 apply 输出 `qa.json`。`--preview changed` 的联系表只代表报告中的 preview_pages，不能误读为整个文档。
+
+按页缓存仅复用排版结果，完整自动校验仍执行。`--no-cache` 可禁用；修改源码、字体、源文件或布局模式会使缓存失效。溢出时 `apply-errors.json` 集中列出全部失败项，成功页保存在工作目录缓存中，失败 PDF 不发布。下一次成功 apply 会清除旧错误报告。`timings_seconds` 不含翻译推理或人工复核时间。

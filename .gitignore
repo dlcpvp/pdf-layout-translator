@@ -1,0 +1,32 @@
+# Python runtime and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/
+
+# Course documents and generated translation artifacts
+*.pdf
+*.log
+source.txt
+manifest.json
+plan.json
+plan.template.json
+qa.json
+qa-draft.json
+apply-errors.json
+layout-cache.json
+translations.json
+preview-original/
+preview-translated/
+preview-draft/
