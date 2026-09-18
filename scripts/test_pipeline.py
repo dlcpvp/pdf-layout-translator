@@ -13,6 +13,29 @@ from layout_hints import background_hint, math_hint, typography_warnings, associ
 
 
 class PipelineTests(unittest.TestCase):
+    def test_white_on_white_rejected_before_publication(self):
+        self.plan['edits'][0].update(color='#ffffff', fill='#ffffff')
+        with self.assertRaisesRegex(ValueError, 'unreadable_text_contrast'):
+            self.apply()
+        self.assertFalse(list(self.output.glob('*.pdf')))
+
+    def test_explicit_wrong_background_rejected(self):
+        self.plan['edits'][0].update(color='#ffffff', fill='#002b52')
+        with self.assertRaisesRegex(ValueError, 'background_fill_mismatch'):
+            self.apply()
+        self.assertFalse(list(self.output.glob('*.pdf')))
+
+    def test_dark_background_keeps_white_text(self):
+        with engine.open_pdf(self.source) as original:
+            page = original[0]
+            page.draw_rect(page.rect, fill=(0, .17, .32), color=None, overlay=False)
+            hints = [background_hint(page, [30, 20, 250, 50])]
+            self.assertEqual(hints[0]['suggested_fill'], '#002b52')
+            ratio = engine.validate_edit_colors('#ffffff', '#002b52', hints, 'test')
+            self.assertGreater(ratio, 10)
+            with self.assertRaisesRegex(ValueError, 'background_fill_mismatch'):
+                engine.validate_edit_colors('#000000', '#ffffff', hints, 'test')
+
     def test_context_math_keeps_notation_but_not_prose(self):
         def block(id, text, box):
             return {'id': id, 'text': text, 'bbox': box, 'spans': [{'size': 20}]}

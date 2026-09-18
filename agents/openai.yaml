@@ -1,4 +1,4 @@
 interface:
   display_name: "PDF 翻译"
   short_description: "翻译论文、报告和课件等文本型 PDF，自动试排并保留图片公式，支持双语对照"
-  default_prompt: "使用 $pdf-layout-translator 将这份 PDF 完整翻译为简体中文，尽量保留页面结构、图片和公式。"
+  default_prompt: "使用 $pdf-layout-translator 将这份 PDF 完整翻译为简体中文，尽量保留页面结构、图片和公式，同时生成译文版和原文/译文逐页交替的对照版。"

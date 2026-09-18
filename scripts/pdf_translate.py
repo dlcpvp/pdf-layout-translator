@@ -311,6 +311,27 @@ def color(value):
     return tuple(int(value[i:i+2], 16)/255 for i in (1, 3, 5))
 
 
+def validate_edit_colors(foreground, fill, hints, context):
+    """Reject invisible text and clear background mismatches before redaction."""
+    fg, bg = color(foreground), color(fill)
+    def luminance(rgb):
+        linear = [c/12.92 if c <= .04045 else ((c+.055)/1.055)**2.4 for c in rgb]
+        return sum(c*w for c, w in zip(linear, (.2126, .7152, .0722)))
+    a, b = sorted((luminance(fg), luminance(bg)))
+    contrast = (b+.05)/(a+.05)
+    # A near-invisibility guard, not a claim of accessibility conformance.
+    if contrast < 1.5:
+        fail(f'{context}: unreadable_text_contrast ({contrast:.2f}); '
+             f'text {foreground}, fill {fill}. Inspect source colors; do not force white fill.')
+    for hint in hints:
+        suggested = hint.get('suggested_fill')
+        if suggested and hint.get('fill_confidence', 0) >= .85:
+            if max(abs(x-y) for x, y in zip(bg, color(suggested))) > 12/255:
+                fail(f'{context}: background_fill_mismatch: fill {fill}, '
+                     f'visible source background {suggested}. Use fill auto or split refs by background.')
+    return round(contrast, 3)
+
+
 def write_scaffold(job, manifest, overwrite=False):
     path = Path(job)/'plan.template.json'
     ensure_outputs([path], [Path(job)/'plan.json', Path(job)/'source.pdf'], overwrite)
@@ -445,19 +466,22 @@ def build_plan(doc, plan, regular, bold, adaptive=False):
         color(foreground)
         fill = edit.get('fill', 'auto')
         fill_method = 'explicit'
+        if pn not in background_cache:
+            background_cache[pn] = (image_for(doc[pn-1], 1), doc[pn-1].get_drawings())
+        raster, drawings = background_cache[pn]
+        hints = [background_hint(doc[pn-1], b, raster, drawings) for b in boxes]
         if fill == 'auto':
-            if pn not in background_cache:
-                background_cache[pn] = (image_for(doc[pn-1], 1), doc[pn-1].get_drawings())
-            raster, drawings = background_cache[pn]
             hint = background_hint(doc[pn-1], list(union(boxes)), raster, drawings)
             fill = hint['suggested_fill']
             if fill is None:
                 fail(f'Edit {ei}: uncertain background; inspect and specify fill explicitly.')
             fill_method = hint['fill_method']
         color(fill)
+        contrast = validate_edit_colors(foreground, fill, hints, f'Page {pn}, edit {ei}')
         records.append({'page': pn, 'refs': edit['refs'], 'atoms': atoms, 'erase': boxes,
                         'box': list(box), 'font_size': size, 'min_scale': minimum,
                         'align': alignment, 'color': foreground, 'fill': fill, 'fill_method': fill_method,
+                        'contrast_ratio': contrast,
                         'html': ''.join(markup.output), 'plain': markup.plain})
     omitted = set(all_spans) - set(taken)
     if omitted:
@@ -1026,7 +1050,7 @@ def parser():
     ap.add_argument('--out-dir', type=Path, required=True)
     ap.add_argument('--font')
     ap.add_argument('--bold-font')
-    ap.add_argument('--mode', choices=['both', 'translated', 'interleaved'], default='translated')
+    ap.add_argument('--mode', choices=['both', 'translated', 'interleaved'], default='both')
     ap.add_argument('--draft', action='store_true', help='Translated-only trial; defer font optimization')
     ap.add_argument('--layout', choices=['auto', 'strict'], default='auto', help='Try bounded safe box adjustments, or preserve exact planned boxes')
     ap.add_argument('--preview', choices=['all', 'changed', 'none'], help='Default: all for final, changed for draft')

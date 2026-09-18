@@ -94,7 +94,7 @@
 
 `fill --job <DIR> --translations <JSON> [--reviewed]` 接受 `{块ID: HTML译文}`，要求 keys 与模板 edits 一一对应，不包含 keep。它沿用模板几何、哈希及 keep 决策，不自动批准复核；检查完 keep 和译文后才传 `--reviewed`。已有非空 plan 需显式 `--overwrite` 才能替换。合并后的多 refs 计划直接编辑，不经 fill 重建。
 
-apply 默认 `--layout auto --mode translated`。自动收剪只在原文行没有碰图片时尝试；扩框只在溢出后尝试，检查其他原文、译文框、图片及新增区域的实际像素，保持 min_scale 下限。不能修复的几何问题仍阻断执行。不会自动合并正文、遗漏译文或跨页重排。
+apply 默认 `--layout auto --mode both`。自动收剪只在原文行没有碰图片时尝试；扩框只在溢出后尝试，检查其他原文、译文框、图片及新增区域的实际像素，保持 min_scale 下限。不能修复的几何问题仍阻断执行。不会自动合并正文、遗漏译文或跨页重排。
 
 `--draft` 跳过压缩与对照合成，输出独立 `_draft.pdf` 和 `qa-draft.json`，不覆盖最终交付；正常 apply 输出 `qa.json`。`--preview changed` 的联系表只代表报告中的 preview_pages，不能误读为整个文档。
 
