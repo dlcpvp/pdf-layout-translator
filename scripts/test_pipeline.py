@@ -123,7 +123,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(final['reused_pages'], [1, 2])
         self.assertEqual(final['typeset_pages'], [])
         self.assertFalse(final['draft'])
-        self.assertTrue((self.output/'source_original-zh-CN.pdf').exists())
+        self.assertTrue((self.output/'source_dual.pdf').exists())
         with engine.open_pdf(self.output/'source_zh-CN.pdf') as doc:
             self.assertIn('新的学习目标', doc[0].get_text())
             self.assertNotIn('Learning objectives', doc[0].get_text())
@@ -219,7 +219,7 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'exactly match'):
             engine.fill_plan(args)
 
-    def test_complete_translation_and_alternating_pages(self):
+    def test_complete_translation_and_side_by_side_pages(self):
         self.apply()
         qa = engine.read_json(self.job/'qa.json')
         self.assertEqual(qa['automatic_checks'], 'pass')
@@ -228,12 +228,20 @@ class PipelineTests(unittest.TestCase):
             self.assertIn('学习目标', translated[0].get_text())
             self.assertIn('E(X) = 2', translated[0].get_text())
             self.assertNotIn('Learning objectives', translated[0].get_text())
+        with engine.open_pdf(self.output/'source_dual.pdf') as paired:
+            self.assertEqual(len(paired), 2)
+            self.assertEqual(paired[0].rect.width, 1000)
+            self.assertIn('Learning objectives', paired[0].get_text())
+            self.assertIn('学习目标', paired[0].get_text())
+            self.assertIn('Next slide', paired[1].get_text())
+            self.assertIn('下一页', paired[1].get_text())
+
+    def test_legacy_interleaved_mode_remains_available(self):
+        self.apply(mode='interleaved', preview='none')
         with engine.open_pdf(self.output/'source_original-zh-CN.pdf') as paired:
             self.assertEqual(len(paired), 4)
             self.assertIn('Learning objectives', paired[0].get_text())
             self.assertIn('学习目标', paired[1].get_text())
-            self.assertIn('Next slide', paired[2].get_text())
-            self.assertIn('下一页', paired[3].get_text())
 
     def test_missing_translation_rejected(self):
         self.plan['edits'].pop()
@@ -290,6 +298,52 @@ class PipelineTests(unittest.TestCase):
                 engine.make_interleaved(source, single, self.root/'bad.pdf')
         single.close()
 
+    def test_side_by_side_count_mismatch(self):
+        single = engine.fitz.open()
+        single.new_page(width=500, height=400)
+        with engine.open_pdf(self.source) as source:
+            with self.assertRaisesRegex(ValueError, 'equal page counts'):
+                engine.make_side_by_side(source, single, self.root/'bad-dual.pdf')
+        single.close()
+
+    def test_mixed_formula_and_footer_require_translation_review(self):
+        formula = {'text': '(𝑋−μ)² and S', 'spans': [{'text': '(𝑋−μ)² and S', 'font': 'CambriaMath'}]}
+        self.assertEqual(math_hint(formula)['suggested_action'], 'translate')
+        formula['text'] = '~ N(0,1) as n→∞'
+        formula['spans'][0]['text'] = formula['text']
+        self.assertEqual(math_hint(formula)['suggested_action'], 'translate')
+        doc = engine.fitz.open()
+        page = doc.new_page(width=500, height=400)
+        page.insert_text((20, 385), 'Copyright 2026 Author Slide 1 of 1', fontsize=10)
+        info = engine.layout(doc)[0]
+        engine.enrich_page(page, info)
+        block = info['blocks'][0]
+        self.assertEqual(block['classification'], 'footer')
+        self.assertEqual(block['suggested_action'], 'translate')
+        doc.close()
+
+    def test_content_audit_reports_prose_kept_with_formula(self):
+        manifest = {'pages': [{'rect': [0, 0, 500, 400], 'images': [], 'blocks': [
+            {'id': 'p001.b000', 'text': 'x and y', 'classification': 'prose_with_math', 'spans': []},
+            {'id': 'p001.b001', 'text': 'B. Author, 2026', 'classification': 'text', 'spans': []}]}]}
+        plan = {'keep': [{'refs': ['p001.b000'], 'reason': 'formula'},
+                         {'refs': ['p001.b001'], 'reason': 'citation'}]}
+        with engine.open_pdf(self.source) as doc:
+            warnings = engine.content_audit(manifest, plan, doc)
+        self.assertEqual([w['code'] for w in warnings], ['prose_inside_keep'])
+
+    def test_glossary_detects_missing_term_before_review(self):
+        template = engine.read_json(self.job/'plan.template.json')
+        mapping = {e['refs'][0]: '译文' for e in template['edits']}
+        supplied = {'translations': mapping, 'glossary': [{'source': 'Learning objectives', 'target': '学习目标'}]}
+        path = self.root/'translation-with-glossary.json'
+        engine.write_json(path, supplied)
+        args = argparse.Namespace(job=self.job, translations=path, reviewed=True, overwrite=False)
+        with self.assertRaisesRegex(ValueError, 'glossary terms missing'):
+            engine.fill_plan(args)
+        warnings = engine.read_json(self.job/'terminology-warnings.json')
+        self.assertEqual(warnings[0]['target'], '学习目标')
+
     def test_source_overwrite_prohibited(self):
         with self.assertRaisesRegex(ValueError, 'overwrite a source'):
             engine.ensure_outputs([self.source], [self.source], True)
@@ -315,6 +369,9 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual((self.job/'plan.json').read_bytes(), original_plan)
         self.assertTrue(draft['review_required'])
         self.assertIn(self.formula, [r for k in draft['keep'] for r in k['refs']])
+        brief = engine.read_json(self.job/'translation-brief.json')
+        self.assertEqual(set(brief['translations']), {e['refs'][0] for e in draft['edits']})
+        self.assertEqual(brief['source_sha256'], draft['source_sha256'])
         self.plan = draft
         with self.assertRaisesRegex(ValueError, 'review_required'):
             self.apply()

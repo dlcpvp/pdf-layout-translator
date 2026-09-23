@@ -1,6 +1,6 @@
 # Translation plan format (version 1)
 
-`prepare` 生成 `manifest.json`、空 `plan.json` 和预填 `plan.template.json`。模板含 `source_text` 供就地翻译，并覆盖所有文本块；将模板复制为 plan 后填写 html、检查建议 keep 和布局，再设置顶层 `review_required: false`。`scaffold --job <DIR>` 可为旧工作目录生成模板，默认不覆盖已有模板，也不会覆盖 plan。引用 ID 只对本次源文件快照和固定版本引擎有效，不能把上次课件的坐标硬套到新文件。
+`prepare` 生成 `manifest.json`、空 `plan.json`、预填 `plan.template.json` 和 `translation-brief.json`。模板含 `source_text` 供就地翻译，并覆盖所有文本块；brief 给每个待译块附上同页相邻内容和复核提示，便于按上下文翻译。将模板复制为 plan 后填写 html、检查建议 keep 和布局，再设置顶层 `review_required: false`。`scaffold --job <DIR>` 可为旧工作目录生成模板和 brief，默认不覆盖已有模板，也不会覆盖 plan。引用 ID 只对本次源文件快照和固定版本引擎有效，不能把上次课件的坐标硬套到新文件。
 
 模板按现有文本块预填，不会自动跨栏或跨段合并。对于拆成多个小块的一条句子，可在同一个 edit 中合并 refs。未知人名、图表说明和含公式的自然语言仍需人工判断；启发式 math_formula 也可能误判，不能跳过 review_required。
 
@@ -92,9 +92,15 @@
 
 ## 快速填写和迭代
 
-`fill --job <DIR> --translations <JSON> [--reviewed]` 接受 `{块ID: HTML译文}`，要求 keys 与模板 edits 一一对应，不包含 keep。它沿用模板几何、哈希及 keep 决策，不自动批准复核；检查完 keep 和译文后才传 `--reviewed`。已有非空 plan 需显式 `--overwrite` 才能替换。合并后的多 refs 计划直接编辑，不经 fill 重建。
+可直接填写 `translation-brief.json` 中的 `translations` 和 `glossary`，再把该文件传给 `fill`。brief 中的 `source_sha256` 会阻止把译文误用于另一份 PDF。
+
+`fill --job <DIR> --translations <JSON> [--reviewed]` 接受 `{块ID: HTML译文}`，要求 keys 与模板 edits 一一对应，不包含 keep。也可传入 `{"translations": {块ID: HTML译文}, "glossary": [{"source": "sample mean", "target": "样本均值"}]}`。术语表逐项检查原文是否包含源词、对应译文是否包含目标词；结果写入 `terminology-warnings.json`，存在缺失时不能使用 `--reviewed`。这是字面匹配提示，词形变化、同义改写仍须人工复核。它沿用模板几何、哈希及 keep 决策，不自动批准复核；检查完 keep 和译文后才传 `--reviewed`。已有非空 plan 需显式 `--overwrite` 才能替换。合并后的多 refs 计划直接编辑，不经 fill 重建。
 
 apply 默认 `--layout auto --mode both`。自动收剪只在原文行没有碰图片时尝试；扩框只在溢出后尝试，检查其他原文、译文框、图片及新增区域的实际像素，保持 min_scale 下限。不能修复的几何问题仍阻断执行。不会自动合并正文、遗漏译文或跨页重排。
+
+`--mode both` 默认生成译文版及每页左右并排的 `_dual.pdf`。`--mode side-by-side` 只生成左右版；`--mode interleaved` 保留旧式原页、译页交替输出。左右版只组合已完成的原页和译页，不改变原位翻译的排版限制。
+
+最终 `qa.json` 的 `content_review_warnings` 提醒保留项中的英文页脚、公式连接词、较大图片中的待核文字，以及译文复制/搜索时可能出现的私用区字符。它不拦截有意保留的版权或书目信息。可用 `audit --job <DIR> --translated <译文PDF>` 对已有成品只读复查，不重新生成 PDF。
 
 `--draft` 跳过压缩与对照合成，输出独立 `_draft.pdf` 和 `qa-draft.json`，不覆盖最终交付；正常 apply 输出 `qa.json`。`--preview changed` 的联系表只代表报告中的 preview_pages，不能误读为整个文档。
 

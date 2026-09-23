@@ -59,12 +59,15 @@ def math_hint(block):
     math_fonts = sum(len(s['text'].strip()) for s in block['spans'] if
                      re.search(r'math|symbol|cmsy|cmmi|cmex', s['font'], re.I))/count
     words = re.findall(r'[A-Za-z]{3,}', normalized)
-    prose = any(w.lower() not in {'var', 'cov', 'exp', 'log', 'sin', 'cos', 'tan', 'lim', 'for', 'and', 'or', 'max', 'min'} for w in words)
+    # Short connectors such as "as" are missed by the 3+ letter word scan.
+    # Keeping their entire block silently leaves prose untranslated.
+    connectors = bool(re.search(r'\b(?:and|or|for|as|of|if|is|to|in|with|then)\b', normalized, re.I))
+    prose = connectors or any(w.lower() not in {'var', 'cov', 'exp', 'log', 'sin', 'cos', 'tan', 'lim', 'max', 'min'} for w in words)
     has_cjk = any('\u3400' <= c <= '\u9fff' for c in normalized)
     operator = bool(re.search(r'[=<>∫∑√≤≥≠±∞]', normalized))
     strong = not prose and not has_cjk and (math_fonts > .45 or math_chars/count > .35 or
                                            (operator and bool(re.search('[A-Za-zα-ωΑ-Ω]', normalized))))
-    return {'classification': 'math_formula' if strong else 'prose_with_math' if math_chars or math_fonts > .1 else 'text',
+    return {'classification': 'math_formula' if strong else 'prose_with_math' if math_chars or math_fonts > .1 or connectors and operator else 'text',
             'suggested_action': 'keep' if strong else 'translate',
             'math_confidence': .95 if strong and (operator or math_fonts > .8) else .8 if strong else .3 if math_chars else 0}
 
@@ -81,7 +84,11 @@ def enrich_page(page, info):
         footer = block['bbox'][1] > height*.9
         if footer and (re.search(r'©|copyright|all rights reserved', text, re.I) or
                        re.fullmatch(r'(?:slide\s*)?\d+(?:\s*(?:of|/)\s*\d+)?', text, re.I)):
-            block.update(classification='footer', suggested_action='keep')
+            # Mixed copyright / author / slide-number lines need translation
+            # decisions per span. Only number-only footers are safe to keep.
+            numeric = bool(re.fullmatch(r'\s*\d+(?:\s*[/–-]\s*\d+)?\s*', text))
+            block.update(classification='footer', suggested_action='keep' if numeric else 'translate',
+                         review_note=None if numeric else 'Footer contains words; translate or split into reviewed spans.')
     associate_math(info['blocks'])
 
 
